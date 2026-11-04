@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<updates>
+    <update>
+        <name>JReviews 5.x Add-on One-Time Web &amp; CLI Installer</name>
+        <description>One-time installer and maintenance utility for JReviews 5.x add-ons in Joomla 4/5.</description>
+        <element>jr_install_addon</element>
+        <type>file</type>
+        <version>2.0.0</version>
+        <downloads>
+            <downloadurl type="full" format="raw">https://raw.githubusercontent.com/TommiLin/JReviews-5.x-Add-on-One-Time-Web-CLI-Installer/main/jr_install_addon.php</downloadurl>
+        </downloads>
+        <downloadurl type="full" format="raw">https://raw.githubusercontent.com/TommiLin/JReviews-5.x-Add-on-One-Time-Web-CLI-Installer/main/jr_install_addon.php</downloadurl>
+        <maintainer>TommiLin</maintainer>
+        <maintainerurl>https://github.com/TommiLin</maintainerurl>
+        <targetplatform name="joomla" version="4.[012345]|5.[012345]"/>
+    </update>
+</updates>
