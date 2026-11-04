@@ -35,4 +35,6 @@ Open `jr_install_addon.php` in any text editor and update the secret token:
 ```php
 const JR_ONETIME_TOKEN = 'your_long_random_secret_token_here'; // Must be at least 16 characters
 const JR_SELF_DELETE = true; // Set to false if you want to keep the script after execution
-![How it looks like](JReviews_Add-on_Installer.png)
+
+
+![How it looks like](images/JReviews_Add-on_Installer.png)
