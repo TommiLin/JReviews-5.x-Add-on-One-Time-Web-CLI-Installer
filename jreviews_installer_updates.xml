@@ -5,7 +5,7 @@
         <description>One-time installer and maintenance utility for JReviews 5.x add-ons in Joomla 4/5.</description>
         <element>jr_install_addon</element>
         <type>file</type>
-        <version>2.1.0</version>
+        <version>2.2.0</version>
         <downloads>
             <downloadurl type="full" format="raw">https://raw.githubusercontent.com/TommiLin/JReviews-5.x-Add-on-One-Time-Web-CLI-Installer/main/jr_install_addon.php</downloadurl>
         </downloads>
