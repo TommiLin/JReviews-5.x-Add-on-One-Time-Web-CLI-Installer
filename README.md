@@ -36,4 +36,35 @@ Open `jr_install_addon.php` in any text editor and update the secret token:
 const JR_ONETIME_TOKEN = 'your_long_random_secret_token_here'; // Must be at least 16 characters
 const JR_SELF_DELETE = true; // Set to false if you want to keep the script after execution
 ```
+### 3. Usage Options
+Option A: Web UI (Browser)
+Navigate to: https://your-site.com/jr_install_addon.php
+
+Enter your JR_ONETIME_TOKEN.
+
+Choose your preferred method:
+
+Discovered Add-ons: Select an existing directory scanned from /components/com_jreviews_addons/.
+
+Upload ZIP Package: Drag and drop your .zip archive.
+
+Manual Entry: Enter the exact add-on folder name manually.
+
+Click Install Add-on.
+
+Option B: Direct URL Trigger
+[https://your-site.com/jr_install_addon.php?token=YOUR_TOKEN&addon=addon_name](https://your-site.com/jr_install_addon.php?token=YOUR_TOKEN&addon=addon_name)
+Option C: SSH / CLI Execution
+Bash
+php jr_install_addon.php token=YOUR_TOKEN addon=addon_name
+
+🔒 Security Notes
+
+⚠️ Important: This script bypasses Joomla's standard authentication checks by using its own token system to execute framework functions.
+
+Always test on staging/test environments first.
+
+Keep JR_SELF_DELETE set to true so the file removes itself immediately after installation.
+
+If installation fails, make sure to manually delete jr_install_addon.php from your server root.
 ![How it looks like](images/JReviews_Add-on_Installer.png)
