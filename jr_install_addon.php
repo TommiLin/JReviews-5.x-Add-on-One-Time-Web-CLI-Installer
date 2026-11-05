@@ -5,7 +5,9 @@
  * Features:
  *   - Auto-scanning, ZIP upload, and Manual entry tabs.
  *   - Automatic DB Backup & Interactive Rollback Panel.
- *   - Interactive Auto-scrolling Terminal Output.
+ *   - Safe .lock file execution blocking mechanism.
+ *   - Quick Purge & Self-Destruct Panel with mutually exclusive options.
+ *   - Interactive Auto-scrolling Terminal Output with auto-scroll on submit.
  *   - Local Installation History Log (`install_history.json`).
  *   - GitHub Release / Update Checker integration.
  *   - Server Diagnostics and Manifest XML preview.
@@ -19,14 +21,14 @@ const JR_ONETIME_TOKEN = 'CHANGE_THIS_TO_A_LONG_RANDOM_SECRET_KEY';
 /**
  * Default post-installation behavior:
  *   - 'delete' : Automatically delete this installer script after success.
- *   - 'reset'  : Keep the script, but reset the token so it cannot be run again.
+ *   - 'reset'  : Keep the script, but create jr_install.lock to block re-execution.
  *   - 'keep'   : Keep the script as is.
  */
 const JR_POST_INSTALL = 'delete';
 
 // GitHub Updates XML URL
 const JR_UPDATE_XML_URL = 'https://raw.githubusercontent.com/TommiLin/JReviews-5.x-Add-on-One-Time-Web-CLI-Installer/main/jreviews_installer_updates.xml';
-const JR_CURRENT_VERSION = '2.1.0';
+const JR_CURRENT_VERSION = '2.3.2';
 // -----------------------------------------------------------------
 
 ini_set('display_errors', '1');
@@ -36,10 +38,24 @@ if (PHP_SAPI === 'cli') {
     parse_str(implode('&', array_slice($argv, 1)), $_GET);
 }
 
+// Check for Lock File (Prevents re-execution without modifying PHP source)
+$lockFile = __DIR__ . '/jr_install.lock';
+if (is_file($lockFile)) {
+    if (isset($_GET['action']) && in_array($_GET['action'], ['get_manifest', 'diagnostics', 'get_history', 'check_updates', 'get_backups'])) {
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode(['success' => false, 'message' => 'Installer is locked. Remove jr_install.lock to unlock.']);
+        exit;
+    }
+    http_response_code(403);
+    header('Content-Type: text/plain; charset=utf-8');
+    echo "[FAIL] Installer is locked by 'jr_install.lock'. Please delete the lock file or the installer script from the server.";
+    exit;
+}
+
 function jr_is_json_request(): bool
 {
     return (isset($_SERVER['HTTP_ACCEPT']) && str_contains($_SERVER['HTTP_ACCEPT'], 'application/json'))
-        || (isset($_GET['action']) && in_array($_GET['action'], ['get_manifest', 'diagnostics', 'get_history', 'check_updates', 'get_backups', 'do_rollback']));
+        || (isset($_GET['action']) && in_array($_GET['action'], ['get_manifest', 'diagnostics', 'get_history', 'check_updates', 'get_backups', 'do_rollback', 'purge_all_backups', 'terminate_self']));
 }
 
 function jr_out(string $msg, bool $ok = true): void
@@ -106,9 +122,9 @@ if (JR_ONETIME_TOKEN === 'CHANGE_THIS_TO_A_LONG_RANDOM_SECRET_KEY' || strlen(JR_
     jr_stop('Security key error: Set a secure JR_ONETIME_TOKEN in the file (minimum 16 characters).', 403);
 }
 
-// Bootstrap Joomla for AJAX actions requiring database
-if (PHP_SAPI !== 'cli' && isset($_GET['action']) && in_array($_GET['action'], ['get_backups', 'do_rollback'])) {
-    $providedToken = (string) ($_GET['token'] ?? '');
+// Bootstrap Joomla for DB operations
+if (PHP_SAPI !== 'cli' && isset($_GET['action']) && in_array($_GET['action'], ['get_backups', 'do_rollback', 'purge_all_backups', 'terminate_self'])) {
+    $providedToken = (string) ($_GET['token'] ?? $_POST['token'] ?? '');
     if (!hash_equals(JR_ONETIME_TOKEN, $providedToken)) {
         header('Content-Type: application/json; charset=utf-8');
         echo json_encode(['success' => false, 'message' => 'Invalid security token']);
@@ -125,7 +141,6 @@ if (PHP_SAPI !== 'cli' && isset($_GET['action']) && in_array($_GET['action'], ['
             ->alias('session', 'session.web.site')
             ->alias('JSession', 'session.web.site')
             ->alias(\Joomla\CMS\Session\Session::class, 'session.web.site')
-            ->alias(\Joomla\Session\Session::class, 'session.web.site')
             ->alias(\Joomla\Session\SessionInterface::class, 'session.web.site');
         $app = $container->get(\Joomla\CMS\Application\SiteApplication::class);
         \Joomla\CMS\Factory::$application = $app;
@@ -141,6 +156,17 @@ if (PHP_SAPI !== 'cli' && isset($_GET['action']) && in_array($_GET['action'], ['
         exit;
     }
 
+    if ($_GET['action'] === 'purge_all_backups') {
+        $tables = $db->setQuery('SHOW TABLES LIKE ' . $db->quote($prefix . 'jreviews_addons_bak_%'))->loadColumn();
+        $count = 0;
+        foreach ($tables as $t) {
+            $db->setQuery('DROP TABLE IF EXISTS ' . $db->quoteName($t))->execute();
+            $count++;
+        }
+        echo json_encode(['success' => true, 'message' => "Successfully dropped $count backup table(s)."]);
+        exit;
+    }
+
     if ($_GET['action'] === 'do_rollback') {
         $backupTable = (string) ($_GET['table'] ?? '');
         $addonToClean = (string) ($_GET['addon'] ?? '');
@@ -152,15 +178,12 @@ if (PHP_SAPI !== 'cli' && isset($_GET['action']) && in_array($_GET['action'], ['
 
         try {
             $targetTable = $prefix . 'jreviews_addons';
-            // Drop target and rename backup back
             $db->setQuery('DROP TABLE IF EXISTS ' . $db->quoteName($targetTable))->execute();
             $db->setQuery('RENAME TABLE ' . $db->quoteName($backupTable) . ' TO ' . $db->quoteName($targetTable))->execute();
 
-            // Clean addon folder if specified
             if ($addonToClean && preg_match('/^[a-z0-9_]{2,60}$/', $addonToClean)) {
                 $addonDir = __DIR__ . '/components/com_jreviews_addons/' . $addonToClean;
                 if (is_dir($addonDir)) {
-                    // Recursive directory delete
                     $files = new RecursiveIteratorIterator(
                         new RecursiveDirectoryIterator($addonDir, RecursiveDirectoryIterator::SKIP_DOTS),
                         RecursiveIteratorIterator::CHILD_FIRST
@@ -179,6 +202,74 @@ if (PHP_SAPI !== 'cli' && isset($_GET['action']) && in_array($_GET['action'], ['
             echo json_encode(['success' => true, 'message' => 'Rollback completed successfully! Database restored and addon folder cleaned.']);
         } catch (\Throwable $e) {
             echo json_encode(['success' => false, 'message' => 'Rollback failed: ' . $e->getMessage()]);
+        }
+        exit;
+    }
+
+    if ($_GET['action'] === 'terminate_self') {
+        while (ob_get_level()) {
+            ob_end_clean();
+        }
+        
+        $delBackups = !empty($_POST['del_backups']);
+        $delHistory = !empty($_POST['del_history']);
+        $createLock = !empty($_POST['create_lock']);
+        $delScript  = !empty($_POST['del_script']);
+
+        $logs = [];
+
+        try {
+            if ($delBackups) {
+                $tables = $db->setQuery('SHOW TABLES LIKE ' . $db->quote($prefix . 'jreviews_addons_bak_%'))->loadColumn();
+                if ($tables) {
+                    foreach ($tables as $t) {
+                        $db->setQuery('DROP TABLE IF EXISTS ' . $db->quoteName($t))->execute();
+                    }
+                    $logs[] = 'Dropped ' . count($tables) . ' backup table(s) from DB.';
+                } else {
+                    $logs[] = 'No backup tables found to drop.';
+                }
+            }
+
+            if ($delHistory) {
+                $historyFile = __DIR__ . '/components/com_jreviews_addons/install_history.json';
+                if (is_file($historyFile)) {
+                    @unlink($historyFile);
+                    $logs[] = 'Removed install_history.json log file.';
+                } else {
+                    $logs[] = 'History log file not found.';
+                }
+            }
+
+            if ($createLock && !$delScript) {
+                if (@file_put_contents(__DIR__ . '/jr_install.lock', date('Y-m-d H:i:s')) !== false) {
+                    $logs[] = 'Created jr_install.lock file successfully.';
+                } else {
+                    $logs[] = 'Warning: Could not create jr_install.lock file (permission denied).';
+                }
+            }
+
+            $responseJson = json_encode(['success' => true, 'logs' => $logs, 'script_deleted' => $delScript]);
+            
+            header('Content-Type: application/json; charset=utf-8');
+            echo $responseJson;
+            
+            if (function_exists('fastcgi_finish_request')) {
+                fastcgi_finish_request();
+            } else {
+                @ob_flush();
+                @flush();
+            }
+
+            if ($delScript) {
+                if (is_file(__DIR__ . '/jr_install.lock')) {
+                    @unlink(__DIR__ . '/jr_install.lock');
+                }
+                @unlink(__FILE__);
+            }
+        } catch (\Throwable $ex) {
+            header('Content-Type: application/json; charset=utf-8');
+            echo json_encode(['success' => false, 'message' => 'Purge error: ' . $ex->getMessage()]);
         }
         exit;
     }
@@ -304,9 +395,19 @@ if (PHP_SAPI !== 'cli' && $_SERVER['REQUEST_METHOD'] === 'GET' && empty($_GET['a
             .header-flex { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 20px; }
             h1 { font-size: 1.5rem; color: #fff; }
             p.subtitle { color: var(--muted); font-size: 0.875rem; }
-            .header-btns { display: flex; gap: 8px; }
-            .diag-btn { background: #334155; color: #fff; border: none; padding: 6px 12px; font-size: 0.8rem; border-radius: 4px; cursor: pointer; transition: background 0.2s; }
+            .header-btns { display: flex; gap: 6px; flex-wrap: wrap; }
+            .diag-btn { background: #334155; color: #fff; border: none; padding: 6px 10px; font-size: 0.8rem; border-radius: 4px; cursor: pointer; transition: background 0.2s; }
             .diag-btn:hover { background: #475569; }
+            .diag-btn.danger { background: rgba(239, 68, 68, 0.2); color: #fca5a5; border: 1px solid var(--danger); }
+            .diag-btn.danger:hover { background: var(--danger); color: #fff; }
+
+            /* Terminate Drawer Panel */
+            .terminate-box { background: rgba(239, 68, 68, 0.08); border: 1px solid var(--danger); border-radius: 8px; padding: 16px; margin-bottom: 20px; display: none; }
+            .terminate-box h3 { color: var(--danger); font-size: 1rem; margin-bottom: 8px; }
+            .terminate-box p { font-size: 0.825rem; color: var(--muted); margin-bottom: 12px; }
+            .purge-options { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; font-size: 0.85rem; }
+            .purge-options label { display: flex; align-items: center; gap: 8px; cursor: pointer; color: #f8fafc; }
+
             .form-group { margin-bottom: 20px; }
             label { display: block; font-size: 0.875rem; font-weight: 500; margin-bottom: 8px; color: var(--muted); }
             input[type="text"], input[type="password"], select { width: 100%; padding: 12px; background: #0f172a; border: 1px solid var(--border); border-radius: 6px; color: #fff; font-size: 0.95rem; outline: none; transition: border 0.2s; }
@@ -361,12 +462,25 @@ if (PHP_SAPI !== 'cli' && $_SERVER['REQUEST_METHOD'] === 'GET' && empty($_GET['a
             <div class="header-flex">
                 <div>
                     <h1>JReviews Add-on Installer</h1>
-                    <p class="subtitle">v<?php echo JR_CURRENT_VERSION; ?> — Maintenance & Installer Utility</p>
+                    <p class="subtitle">v<?php echo JR_CURRENT_VERSION; ?> — Maintenance Utility</p>
                 </div>
                 <div class="header-btns">
-                    <button type="button" class="diag-btn" onclick="checkUpdates()">Updates</button>
-                    <button type="button" class="diag-btn" onclick="runDiagnostics()">Diagnostics</button>
+                    <button type="button" class="diag-btn" onclick="toggleUpdates()">Updates</button>
+                    <button type="button" class="diag-btn" onclick="toggleDiagnostics()">Diagnostics</button>
+                    <button type="button" class="diag-btn danger" onclick="toggleTerminateBox()">⚡ Terminate & Delete</button>
                 </div>
+            </div>
+
+            <div class="terminate-box" id="terminateBox">
+                <h3>⚡ Quick Purge & Self-Destruct Panel</h3>
+                <p>Select what to clean up before closing or destroying this installer utility:</p>
+                <div class="purge-options">
+                    <label><input type="checkbox" id="purge_db_backups" checked> Drop all <code>jreviews_addons_bak_*</code> tables from DB</label>
+                    <label><input type="checkbox" id="purge_history_log" checked> Delete local <code>install_history.json</code> file</label>
+                    <label><input type="checkbox" id="purge_create_lock" onchange="handleMutualExclusive('lock')"> Create <code>jr_install.lock</code> to block future runs</label>
+                    <label><input type="checkbox" id="purge_unlink_script" checked onchange="handleMutualExclusive('script')"> Permanently delete this <code>jr_install_addon.php</code> file</label>
+                </div>
+                <button type="button" class="submit-btn danger-btn" onclick="executeSelfDestruct()">Execute Selected Purge Actions</button>
             </div>
 
             <div class="update-banner" id="updateBanner"></div>
@@ -429,7 +543,10 @@ if (PHP_SAPI !== 'cli' && $_SERVER['REQUEST_METHOD'] === 'GET' && empty($_GET['a
                         <label for="rollback_addon_name">Add-on Folder to Clean on Rollback (optional)</label>
                         <input type="text" id="rollback_addon_name" placeholder="e.g. my_broken_addon">
                     </div>
-                    <button type="button" class="submit-btn danger-btn" onclick="executeRollback()" style="margin-top: 10px;">Execute Rollback</button>
+                    <div style="display: flex; gap: 10px;">
+                        <button type="button" class="submit-btn danger-btn" onclick="executeRollback()" style="flex: 2;">Execute Rollback</button>
+                        <button type="button" class="submit-btn" onclick="purgeAllBackups()" style="flex: 1; background: #475569;">Purge All DB Backups</button>
+                    </div>
                 </div>
 
                 <div id="tab-history" class="tab-content">
@@ -454,7 +571,7 @@ if (PHP_SAPI !== 'cli' && $_SERVER['REQUEST_METHOD'] === 'GET' && empty($_GET['a
                         <label for="post_action">Post-Installation Action</label>
                         <select id="post_action" name="post_action">
                             <option value="delete" <?php echo JR_POST_INSTALL === 'delete' ? 'selected' : ''; ?>>Delete installer script automatically</option>
-                            <option value="reset" <?php echo JR_POST_INSTALL === 'reset' ? 'selected' : ''; ?>>Reset token & keep script</option>
+                            <option value="reset" <?php echo JR_POST_INSTALL === 'reset' ? 'selected' : ''; ?>>Create .lock file & keep script</option>
                             <option value="keep" <?php echo JR_POST_INSTALL === 'keep' ? 'selected' : ''; ?>>Keep script as is</option>
                         </select>
                     </div>
@@ -474,6 +591,21 @@ if (PHP_SAPI !== 'cli' && $_SERVER['REQUEST_METHOD'] === 'GET' && empty($_GET['a
         <script>
             let currentTab = 'scan';
 
+            function toggleTerminateBox() {
+                const box = document.getElementById('terminateBox');
+                box.style.display = (box.style.display === 'block') ? 'none' : 'block';
+            }
+
+            function handleMutualExclusive(source) {
+                const lockCb = document.getElementById('purge_create_lock');
+                const scriptCb = document.getElementById('purge_unlink_script');
+                if (source === 'lock' && lockCb.checked) {
+                    scriptCb.checked = false;
+                } else if (source === 'script' && scriptCb.checked) {
+                    lockCb.checked = false;
+                }
+            }
+
             function switchTab(tabName, evt) {
                 currentTab = tabName;
                 document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
@@ -484,7 +616,6 @@ if (PHP_SAPI !== 'cli' && $_SERVER['REQUEST_METHOD'] === 'GET' && empty($_GET['a
                 }
                 document.getElementById('tab-' + tabName).classList.add('active');
 
-                // Hide/show install controls button if rollback tab is active
                 document.getElementById('installControls').style.display = (tabName === 'rollback') ? 'none' : 'block';
 
                 if (tabName === 'scan') fetchManifest();
@@ -496,6 +627,73 @@ if (PHP_SAPI !== 'cli' && $_SERVER['REQUEST_METHOD'] === 'GET' && empty($_GET['a
                 const isChecked = document.getElementById('create_backup').checked;
                 document.getElementById('backupWarning').style.display = isChecked ? 'block' : 'none';
                 if (isChecked) document.getElementById('post_action').value = 'keep';
+            }
+
+            async function executeSelfDestruct() {
+                const token = document.getElementById('token').value;
+                if (!token) { alert('Enter Security Token first.'); return; }
+
+                if (!confirm('Are you sure you want to execute the selected purge and self-destruct actions?')) return;
+
+                const formData = new FormData();
+                formData.append('del_backups', document.getElementById('purge_db_backups').checked ? '1' : '');
+                formData.append('del_history', document.getElementById('purge_history_log').checked ? '1' : '');
+                formData.append('create_lock', document.getElementById('purge_create_lock').checked ? '1' : '');
+                formData.append('del_script', document.getElementById('purge_unlink_script').checked ? '1' : '');
+
+                const term = document.getElementById('terminal');
+                const content = document.getElementById('terminalContent');
+                term.style.display = 'block';
+                content.innerHTML = '<div class="terminal-line">Executing self-destruct sequence...</div>';
+                term.scrollIntoView({ behavior: 'smooth' });
+
+                try {
+                    const res = await fetch(`jr_install_addon.php?action=terminate_self&token=${encodeURIComponent(token)}`, {
+                        method: 'POST',
+                        body: formData
+                    });
+                    
+                    const rawText = await res.text();
+                    if (!rawText.trim()) {
+                        throw new Error('Server returned empty response (script might have self-deleted instantly).');
+                    }
+
+                    if (rawText.trim().startsWith('<') || rawText.includes('<!DOCTYPE') || rawText.includes('<br')) {
+                        throw new Error('Server returned HTML error page instead of JSON. Check PHP error logs.');
+                    }
+
+                    const data = JSON.parse(rawText);
+                    if (data.success && data.logs) {
+                        data.logs.forEach(msg => {
+                            content.innerHTML += `<div class="terminal-line ok">[ OK ] ${msg}</div>`;
+                        });
+                        if (data.script_deleted) {
+                            content.innerHTML += `<div class="terminal-line fail">[TERMINATED] Script file deleted. Access revoked.</div>`;
+                            document.getElementById('installForm').style.opacity = '0.3';
+                            document.getElementById('installForm').style.pointerEvents = 'none';
+                        }
+                    } else {
+                        content.innerHTML += `<div class="terminal-line fail">[FAIL] ${data.message || 'Unknown error'}</div>`;
+                    }
+                } catch (e) {
+                    content.innerHTML += `<div class="terminal-line fail">[FAIL] Execution error: ${e.message}</div>`;
+                }
+                term.scrollTop = term.scrollHeight;
+            }
+
+            async function purgeAllBackups() {
+                const token = document.getElementById('token').value;
+                if (!token) { alert('Enter Security Token first.'); return; }
+                if (!confirm('Drop ALL jreviews_addons_bak_* tables from the database?')) return;
+
+                try {
+                    const res = await fetch(`jr_install_addon.php?action=purge_all_backups&token=${encodeURIComponent(token)}`);
+                    const data = await res.json();
+                    alert(data.message);
+                    fetchBackups();
+                } catch (e) {
+                    alert('Error purging backups: ' + e.message);
+                }
             }
 
             async function fetchBackups() {
@@ -512,15 +710,10 @@ if (PHP_SAPI !== 'cli' && $_SERVER['REQUEST_METHOD'] === 'GET' && empty($_GET['a
                             return;
                         }
                         let html = '';
-                        data.backupList = data.backups;
-                        data.backups.forEach(b => {
-                            html += `<option value="${b}">${b}</option>`;
-                        });
+                        data.backups.forEach(b => { html += `<option value="${b}">${b}</option>`; });
                         select.innerHTML = html;
                     }
-                } catch (e) {
-                    select.innerHTML = '<option value="">Error loading backups</option>';
-                }
+                } catch (e) { select.innerHTML = '<option value="">Error loading backups</option>'; }
             }
 
             async function executeRollback() {
@@ -528,39 +721,37 @@ if (PHP_SAPI !== 'cli' && $_SERVER['REQUEST_METHOD'] === 'GET' && empty($_GET['a
                 const table = document.getElementById('backup_select').value;
                 const addon = document.getElementById('rollback_addon_name').value.trim();
 
-                if (!token || !table) {
-                    alert('Please enter your security token and select a backup table.');
-                    return;
-                }
-
-                if (!confirm(`Are you sure you want to restore database table from "${table}" and clean addon folder "${addon || 'none'}"?`)) {
-                    return;
-                }
+                if (!token || !table) { alert('Select security token and backup table.'); return; }
+                if (!confirm(`Restore database from "${table}" and clean folder "${addon || 'none'}"?`)) return;
 
                 const term = document.getElementById('terminal');
                 const content = document.getElementById('terminalContent');
                 term.style.display = 'block';
                 content.innerHTML = '<div class="terminal-line">Executing rollback...</div>';
+                term.scrollIntoView({ behavior: 'smooth' });
 
                 try {
                     const res = await fetch(`jr_install_addon.php?action=do_rollback&token=${encodeURIComponent(token)}&table=${encodeURIComponent(table)}&addon=${encodeURIComponent(addon)}`);
                     const data = await res.json();
-                    if (data.success) {
-                        content.innerHTML += `<div class="terminal-line ok">[ OK ] ${data.message}</div>`;
-                        fetchBackups();
-                    } else {
-                        content.innerHTML += `<div class="terminal-line fail">[FAIL] ${data.message}</div>`;
-                    }
+                    content.innerHTML += `<div class="terminal-line ${data.success ? 'ok' : 'fail'}">${data.success ? '[ OK ]' : '[FAIL]'} ${data.message}</div>`;
+                    if (data.success) fetchBackups();
                 } catch (e) {
                     content.innerHTML += `<div class="terminal-line fail">[FAIL] Network error during rollback: ${e.message}</div>`;
                 }
                 term.scrollTop = term.scrollHeight;
             }
 
-            async function checkUpdates() {
-                const token = document.getElementById('token').value;
+            async function toggleUpdates() {
                 const banner = document.getElementById('updateBanner');
-                if (!token) { alert('Enter your Security Token first.'); return; }
+                // Если блок уже виден — скрываем его при повторном клике
+                if (banner.style.display === 'block') {
+                    banner.style.display = 'none';
+                    return;
+                }
+
+                const token = document.getElementById('token').value;
+                if (!token) { alert('Enter Security Token first.'); return; }
+                
                 banner.style.display = 'block';
                 banner.textContent = 'Checking updates...';
                 try {
@@ -570,6 +761,33 @@ if (PHP_SAPI !== 'cli' && $_SERVER['REQUEST_METHOD'] === 'GET' && empty($_GET['a
                         banner.innerHTML = data.has_update ? `🚀 <strong>New Version (${data.latest_version}):</strong> <a href="${data.download_url}" target="_blank" style="color:#fff;">Download from GitHub</a>` : `✅ You are on the latest version.`;
                     }
                 } catch (e) { banner.textContent = 'Update check failed.'; }
+            }
+
+            async function toggleDiagnostics() {
+                const box = document.getElementById('diagResults');
+                // Если блок уже виден — скрываем его при повторном клике
+                if (box.style.display === 'block') {
+                    box.style.display = 'none';
+                    return;
+                }
+
+                const token = document.getElementById('token').value;
+                if (!token) { alert('Enter Token first.'); return; }
+                
+                box.style.display = 'block';
+                box.innerHTML = '<div class="diag-row"><span>Running diagnostics...</span></div>';
+                try {
+                    const res = await fetch(`jr_install_addon.php?action=diagnostics&token=${encodeURIComponent(token)}`);
+                    const data = await res.json();
+                    if (data.success && data.checks) {
+                        let html = '';
+                        for (const k in data.checks) {
+                            const c = data.checks[k];
+                            html += `<div class="diag-row"><span>${c.title}</span><span class="${c.ok ? 'status-ok' : 'status-fail'}">${c.ok ? 'PASS' : 'FAIL'}</span></div>`;
+                        }
+                        box.innerHTML = html;
+                    }
+                } catch (e) { box.innerHTML = '<div class="diag-row"><span>Diagnostics failed.</span></div>'; }
             }
 
             async function fetchHistory() {
@@ -602,23 +820,6 @@ if (PHP_SAPI !== 'cli' && $_SERVER['REQUEST_METHOD'] === 'GET' && empty($_GET['a
                 }
             }
 
-            async function runDiagnostics() {
-                const token = document.getElementById('token').value;
-                const box = document.getElementById('diagResults');
-                if (!token) { alert('Enter Token first.'); return; }
-                box.style.display = 'block';
-                const res = await fetch(`jr_install_addon.php?action=diagnostics&token=${encodeURIComponent(token)}`);
-                const data = await res.json();
-                if (data.success && data.checks) {
-                    let html = '';
-                    for (const k in data.checks) {
-                        const c = data.checks[k];
-                        html += `<div class="diag-row"><span>${c.title}</span><span class="${c.ok ? 'status-ok' : 'status-fail'}">${c.ok ? 'PASS' : 'FAIL'}</span></div>`;
-                    }
-                    box.innerHTML = html;
-                }
-            }
-
             const dropZone = document.getElementById('dropZone');
             const fileInput = document.getElementById('zip_file');
             const fileNameDiv = document.getElementById('fileName');
@@ -638,6 +839,12 @@ if (PHP_SAPI !== 'cli' && $_SERVER['REQUEST_METHOD'] === 'GET' && empty($_GET['a
             document.getElementById('installForm').addEventListener('submit', async function(e) {
                 e.preventDefault();
                 document.getElementById('terminalContent').innerHTML = '';
+                
+                // Автопрокрутка к терминалу при старте установки
+                const term = document.getElementById('terminal');
+                term.style.display = 'block';
+                term.scrollIntoView({ behavior: 'smooth' });
+
                 const btn = document.getElementById('submitBtn');
                 btn.disabled = true;
                 const formData = new FormData(this);
@@ -711,7 +918,11 @@ define('JPATH_BASE', __DIR__);
 require_once JPATH_BASE . '/includes/defines.php';
 require_once JPATH_BASE . '/includes/framework.php';
 
+while (ob_get_level()) {
+    ob_end_clean();
+}
 ob_start();
+
 try {
     $container = \Joomla\CMS\Factory::getContainer();
     $container->alias('session.web', 'session.web.site')
@@ -751,15 +962,19 @@ try {
     jr_out(sprintf('jreviews_addons status: id=%d name=%s state=%d version=%s', $row->id, $row->name, $row->state, $row->version));
     jr_save_history($addon, 'SUCCESS', 'Version: ' . $row->version);
 
+    echo ob_get_clean();
+
+    if (function_exists('fastcgi_finish_request')) {
+        fastcgi_finish_request();
+    } else {
+        @ob_flush();
+        @flush();
+    }
+
     if ($postAction === 'delete') {
         @unlink(__FILE__);
-        jr_out('Installer script successfully self-deleted.');
     } elseif ($postAction === 'reset') {
-        $content = str_replace(JR_ONETIME_TOKEN, 'EXPIRED_TOKEN_RESET', file_get_contents(__FILE__));
-        @file_put_contents(__FILE__, $content);
-        jr_out('Security token reset in script file.');
-    } else {
-        jr_out('Installer script retained on server.');
+        @file_put_contents(__DIR__ . '/jr_install.lock', date('Y-m-d H:i:s'));
     }
 } catch (\Throwable $e) {
     jr_save_history($addon, 'FAILED', $e->getMessage());
@@ -767,4 +982,3 @@ try {
     jr_out($e->getMessage(), false);
     exit;
 }
-echo ob_get_clean();
